@@ -2,7 +2,7 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam:sonar-capture-control",
   "visibility": "public_unlisted",
-  "url": "",
+  "url": "https://github.com/viam-labs/sonar-capture-control",
   "description": "Modular sensor component: capture-control",
   "applications": null,
   "markdown_link": "README.md",
