@@ -415,7 +415,7 @@ type fakeDetection struct {
 	score float64
 }
 
-func (f *fakeDetection) BoundingBox() *image.Rectangle     { return nil }
+func (f *fakeDetection) BoundingBox() *image.Rectangle    { return nil }
 func (f *fakeDetection) NormalizedBoundingBox() []float64 { return nil }
 func (f *fakeDetection) Score() float64                   { return f.score }
 func (f *fakeDetection) Label() string                    { return f.label }
