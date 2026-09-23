@@ -275,7 +275,9 @@ func TestAutoStartFromDetection(t *testing.T) {
 	cfg := testConfig()
 	cfg.AutoCaptureFrequencyHz = 1
 	s := newTestSensor(t, cfg, func() time.Time { return fixed })
-	s.detect = func(ctx context.Context) (bool, error) { return true, nil }
+	s.detect = func(ctx context.Context) (detectOutcome, error) {
+		return detectOutcome{found: true, bestScore: 0.91, sawLabel: true}, nil
+	}
 
 	s.tickDetection(context.Background())
 
@@ -303,7 +305,9 @@ func TestDetectionRefreshesLastSeen(t *testing.T) {
 	cfg := testConfig()
 	cfg.InactivitySeconds = 10
 	s := newTestSensor(t, cfg, func() time.Time { return now })
-	s.detect = func(ctx context.Context) (bool, error) { return true, nil }
+	s.detect = func(ctx context.Context) (detectOutcome, error) {
+		return detectOutcome{found: true, bestScore: 0.91, sawLabel: true}, nil
+	}
 
 	s.tickDetection(context.Background())
 	first := s.lastDetectionAt
@@ -324,18 +328,25 @@ func TestInactivityStopsAfterDetection(t *testing.T) {
 	cfg := testConfig()
 	cfg.InactivitySeconds = 10
 	s := newTestSensor(t, cfg, func() time.Time { return now })
-	s.detect = func(ctx context.Context) (bool, error) { return true, nil }
+	s.detect = func(ctx context.Context) (detectOutcome, error) {
+		return detectOutcome{found: true, bestScore: 0.91, sawLabel: true}, nil
+	}
 
 	s.tickDetection(context.Background())
 	if !s.sequenceActive {
 		t.Fatal("expected active after detection")
 	}
 
-	s.detect = func(ctx context.Context) (bool, error) { return false, nil }
+	s.detect = func(ctx context.Context) (detectOutcome, error) {
+		return detectOutcome{found: false, bestScore: 0.42, sawLabel: true}, nil
+	}
 	now = start.Add(10 * time.Second)
 	s.tickDetection(context.Background())
 	if s.sequenceActive {
 		t.Fatal("expected auto-stop after inactivity with prior detection")
+	}
+	if !s.lastPollSawLabel || s.lastPollBestScore != 0.42 {
+		t.Fatalf("expected last poll score 0.42, got saw=%v score=%v", s.lastPollSawLabel, s.lastPollBestScore)
 	}
 }
 
@@ -354,7 +365,9 @@ func TestManualOnlyNoAutoStop(t *testing.T) {
 	}
 
 	now = start.Add(30 * time.Second)
-	s.detect = func(ctx context.Context) (bool, error) { return false, nil }
+	s.detect = func(ctx context.Context) (detectOutcome, error) {
+		return detectOutcome{found: false, bestScore: 0.42, sawLabel: true}, nil
+	}
 	s.tickDetection(context.Background())
 	readings, err := s.Readings(context.Background(), nil)
 	if err != nil {
@@ -383,13 +396,17 @@ func TestManualThenDetectionThenInactivityStops(t *testing.T) {
 	}
 
 	now = start.Add(2 * time.Second)
-	s.detect = func(ctx context.Context) (bool, error) { return true, nil }
+	s.detect = func(ctx context.Context) (detectOutcome, error) {
+		return detectOutcome{found: true, bestScore: 0.88, sawLabel: true}, nil
+	}
 	s.tickDetection(context.Background())
 	if !s.seenDetectionThisSession {
 		t.Fatal("detection after manual start should set seenDetectionThisSession")
 	}
 
-	s.detect = func(ctx context.Context) (bool, error) { return false, nil }
+	s.detect = func(ctx context.Context) (detectOutcome, error) {
+		return detectOutcome{found: false, bestScore: 0.55, sawLabel: true}, nil
+	}
 	now = start.Add(12 * time.Second)
 	s.tickDetection(context.Background())
 	if s.sequenceActive {
@@ -402,11 +419,17 @@ func TestMatchingDetection(t *testing.T) {
 		&fakeDetection{label: "noise", score: 0.99},
 		&fakeDetection{label: "DownSonar", score: 0.81},
 	}
-	if !matchingDetection(dets, "downsonar", 0.8) {
-		t.Fatal("expected case-insensitive match")
+	out := evaluateDetections(dets, "downsonar", 0.8)
+	if !out.found || !out.sawLabel || out.bestScore != 0.81 {
+		t.Fatalf("out=%+v", out)
 	}
-	if matchingDetection(dets, "downsonar", 0.9) {
-		t.Fatal("score below threshold should not match")
+	out = evaluateDetections(dets, "downsonar", 0.9)
+	if out.found || !out.sawLabel || out.bestScore != 0.81 {
+		t.Fatalf("below threshold out=%+v", out)
+	}
+	out = evaluateDetections(dets, "missing", 0.8)
+	if out.found || out.sawLabel {
+		t.Fatalf("missing label out=%+v", out)
 	}
 }
 

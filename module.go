@@ -171,8 +171,18 @@ func (cfg *Config) autoCaptureFrequency() float32 {
 	return cfg.AutoCaptureFrequencyHz
 }
 
-// detectFunc is injectable for tests. Returns whether a matching detection was seen.
-type detectFunc func(ctx context.Context) (bool, error)
+// detectOutcome is the result of one vision poll for the configured label.
+type detectOutcome struct {
+	// found is true when the label is present at or above detection_confidence.
+	found bool
+	// bestScore is the highest score for the configured label on this poll.
+	bestScore float64
+	// sawLabel is true when any detection had the configured label (any score).
+	sawLabel bool
+}
+
+// detectFunc is injectable for tests.
+type detectFunc func(ctx context.Context) (detectOutcome, error)
 
 type sonarCaptureControlCaptureControl struct {
 	resource.AlwaysRebuild
@@ -200,6 +210,10 @@ type sonarCaptureControlCaptureControl struct {
 	chunkStartedAt           time.Time
 	lastDetectionAt          time.Time
 	seenDetectionThisSession bool
+	// lastPoll* tracks the most recent successful detection poll for stop logs.
+	lastPollAt        time.Time
+	lastPollBestScore float64
+	lastPollSawLabel  bool
 }
 
 func newSonarCaptureControlCaptureControl(
@@ -333,9 +347,8 @@ func (s *sonarCaptureControlCaptureControl) DoCommand(ctx context.Context, cmd m
 
 	case cmd["stop_capture"] == true:
 		s.mu.Lock()
-		s.stopSessionLocked()
+		s.stopSessionLocked("manual DoCommand stop_capture")
 		s.mu.Unlock()
-		s.logger.Info("stop_capture (sequence closed)")
 		return nil, nil
 
 	case cmd["start_sequence"] == true:
@@ -361,6 +374,8 @@ func (s *sonarCaptureControlCaptureControl) DoCommand(ctx context.Context, cmd m
 
 	case cmd["stop_sequence"] == true:
 		s.mu.Lock()
+		wasActive := s.sequenceActive
+		sessionTag := s.sessionTag
 		s.sequenceActive = false
 		s.sessionTag = ""
 		s.chunkIndex = 0
@@ -368,7 +383,11 @@ func (s *sonarCaptureControlCaptureControl) DoCommand(ctx context.Context, cmd m
 		s.lastDetectionAt = time.Time{}
 		s.seenDetectionThisSession = false
 		s.mu.Unlock()
-		s.logger.Info("stop_sequence")
+		if wasActive {
+			s.logger.Infof("stop_sequence reason=manual session=%v", sessionTag)
+		} else {
+			s.logger.Info("stop_sequence reason=manual (already idle)")
+		}
 		return nil, nil
 	}
 	return nil, fmt.Errorf("unknown command: %v", cmd)
@@ -402,8 +421,11 @@ func (s *sonarCaptureControlCaptureControl) startSessionLocked(freq float32, ext
 }
 
 // stopSessionLocked ends the current session and clears detection state.
+// reason is logged so operators can tell manual vs inactivity stops apart.
 // Caller must hold s.mu.
-func (s *sonarCaptureControlCaptureControl) stopSessionLocked() {
+func (s *sonarCaptureControlCaptureControl) stopSessionLocked(reason string) {
+	sessionTag := s.sessionTag
+	wasActive := s.sequenceActive
 	s.captureFrequencyHz = 0
 	s.sequenceActive = false
 	s.sessionTag = ""
@@ -412,6 +434,11 @@ func (s *sonarCaptureControlCaptureControl) stopSessionLocked() {
 	s.lastDetectionAt = time.Time{}
 	s.seenDetectionThisSession = false
 	s.extraTags = append([]string(nil), s.cfg.DefaultTags...)
+	if wasActive {
+		s.logger.Infof("stop_capture reason=%s session=%v", reason, sessionTag)
+	} else {
+		s.logger.Infof("stop_capture reason=%s (already idle)", reason)
+	}
 }
 
 func (s *sonarCaptureControlCaptureControl) pollDetections() {
@@ -431,7 +458,7 @@ func (s *sonarCaptureControlCaptureControl) tickDetection(ctx context.Context) {
 	if s.detect == nil {
 		return
 	}
-	found, err := s.detect(ctx)
+	out, err := s.detect(ctx)
 	if err != nil {
 		s.logger.Warnf("detection poll failed: %v", err)
 		s.mu.Lock()
@@ -443,11 +470,16 @@ func (s *sonarCaptureControlCaptureControl) tickDetection(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	if found {
+	s.lastPollAt = now
+	s.lastPollBestScore = out.bestScore
+	s.lastPollSawLabel = out.sawLabel
+
+	if out.found {
 		if !s.sequenceActive {
 			freq := s.cfg.autoCaptureFrequency()
 			s.startSessionLocked(freq, append([]string(nil), s.cfg.DefaultTags...), true)
-			s.logger.Infof("auto start_capture frequency_hz=%v session=%v (detection)", freq, s.sessionTag)
+			s.logger.Infof("auto start_capture frequency_hz=%v session=%v score=%.3f label=%s",
+				freq, s.sessionTag, out.bestScore, s.cfg.detectionLabel())
 		} else {
 			s.lastDetectionAt = now
 			s.seenDetectionThisSession = true
@@ -457,28 +489,45 @@ func (s *sonarCaptureControlCaptureControl) tickDetection(ctx context.Context) {
 	s.maybeInactivityStopLocked()
 }
 
-func (s *sonarCaptureControlCaptureControl) detectFromVision(ctx context.Context) (bool, error) {
+func (s *sonarCaptureControlCaptureControl) detectFromVision(ctx context.Context) (detectOutcome, error) {
 	if s.vision == nil {
-		return false, fmt.Errorf("vision service not configured")
+		return detectOutcome{}, fmt.Errorf("vision service not configured")
 	}
 	dets, err := s.vision.DetectionsFromCamera(ctx, s.cfg.Camera, nil)
 	if err != nil {
-		return false, err
+		return detectOutcome{}, err
 	}
-	return matchingDetection(dets, s.cfg.detectionLabel(), s.cfg.detectionConfidence()), nil
+	return evaluateDetections(dets, s.cfg.detectionLabel(), s.cfg.detectionConfidence()), nil
 }
 
-func matchingDetection(dets []objectdetection.Detection, label string, minScore float64) bool {
+func evaluateDetections(dets []objectdetection.Detection, label string, minScore float64) detectOutcome {
+	best, saw := bestLabelScore(dets, label)
+	return detectOutcome{
+		found:     saw && best >= minScore,
+		bestScore: best,
+		sawLabel:  saw,
+	}
+}
+
+func bestLabelScore(dets []objectdetection.Detection, label string) (best float64, saw bool) {
 	want := strings.ToLower(label)
 	for _, d := range dets {
 		if d == nil {
 			continue
 		}
-		if strings.ToLower(d.Label()) == want && d.Score() >= minScore {
-			return true
+		if strings.ToLower(d.Label()) != want {
+			continue
+		}
+		saw = true
+		if d.Score() > best {
+			best = d.Score()
 		}
 	}
-	return false
+	return best, saw
+}
+
+func matchingDetection(dets []objectdetection.Detection, label string, minScore float64) bool {
+	return evaluateDetections(dets, label, minScore).found
 }
 
 // maybeInactivityStopLocked stops the session when inactivity has elapsed after
@@ -487,11 +536,31 @@ func (s *sonarCaptureControlCaptureControl) maybeInactivityStopLocked() {
 	if !s.sequenceActive || !s.seenDetectionThisSession || s.lastDetectionAt.IsZero() {
 		return
 	}
-	if s.now().Sub(s.lastDetectionAt) < s.cfg.inactivity() {
+	now := s.now()
+	since := now.Sub(s.lastDetectionAt)
+	if since < s.cfg.inactivity() {
 		return
 	}
-	s.logger.Infof("auto stop_capture session=%v (inactivity %v)", s.sessionTag, s.cfg.inactivity())
-	s.stopSessionLocked()
+	label := s.cfg.detectionLabel()
+	conf := s.cfg.detectionConfidence()
+	scoreInfo := "none (label not present on last poll)"
+	if s.lastPollSawLabel {
+		scoreInfo = fmt.Sprintf("%.3f (below confidence %.2f)", s.lastPollBestScore, conf)
+		if s.lastPollBestScore >= conf {
+			// Qualifying score on last poll but still stopping means polls
+			// failed or clock skew; still report the number.
+			scoreInfo = fmt.Sprintf("%.3f", s.lastPollBestScore)
+		}
+	} else if !s.lastPollAt.IsZero() {
+		scoreInfo = "none (label not present on last poll)"
+	} else {
+		scoreInfo = "unknown (no successful poll yet)"
+	}
+	reason := fmt.Sprintf(
+		"inactivity: no %s >= %.2f for %v (last qualifying detection %v ago); last_poll_%s_score=%s",
+		label, conf, s.cfg.inactivity(), since.Round(time.Millisecond), label, scoreInfo,
+	)
+	s.stopSessionLocked(reason)
 }
 
 // maybeRolloverLocked advances the chunk when the current Sequence has been open
