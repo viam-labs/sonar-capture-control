@@ -1,6 +1,6 @@
 # Model viam:sonar-capture-control:capture-control
 
-Sensor that drives Data Manager capture via `overrides` and `sequences`. Supports manual DoCommand start/stop and optional vision-driven auto start/stop when `downsonar` (or another label) is detected.
+Sensor that drives Data Manager capture via `overrides` and can tag each captured image with bucketed sensor readings (`band_tags`). Supports manual DoCommand start/stop and optional vision-driven auto start/stop when `downsonar` (or another label) is detected.
 
 ## Configuration
 
@@ -15,7 +15,6 @@ Sensor that drives Data Manager capture via `overrides` and `sequences`. Support
   ],
   "default_capture_frequency_hz": 0,
   "default_tags": [],
-  "sequence_max_seconds": 60,
   "inactivity_seconds": 10,
   "vision": "sonar-finder-service",
   "camera": "HDMICapture",
@@ -30,10 +29,10 @@ Sensor that drives Data Manager capture via `overrides` and `sequences`. Support
 
 | Name | Type | Inclusion | Description |
 |------|------|-----------|-------------|
-| `resources` | array | Required | Resource/method pairs to control under overrides/sequences |
+| `resources` | array | Required | Resource/method pairs to control under overrides |
 | `default_capture_frequency_hz` | float | Optional | Frequency until `start_capture` / auto-start (0 = off) |
-| `default_tags` | string[] | Optional | Base tags merged into overrides/sequences |
-| `sequence_max_seconds` | float | Optional | Chunk rollover while session stays active (default 60) |
+| `default_tags` | string[] | Optional | Base tags merged into overrides |
+| `band_tags` | array | Optional | Sensor readings added to each image as bucketed tags. Each entry: `sensor`, `reading`, `tag`, `width`, optional `unit` — e.g. `{"sensor": "depth", "reading": "Depth", "tag": "depth_band", "width": 10, "unit": "fm"}` tags a 23.4 fm reading `depth_band:20-30fm` |
 | `inactivity_seconds` | float | Optional | Auto-stop after this gap **only if** the session has seen ≥1 detection (default 10). Manual-only sessions are not auto-stopped |
 | `vision` | string | Optional | Vision service for auto start/stop. Omit for Phase 1 manual-only |
 | `camera` | string | Required if `vision` set | Camera name passed to `DetectionsFromCamera` |
@@ -46,11 +45,12 @@ When `vision` is set, Validate requires `camera` and both are returned as requir
 
 ## Behavior
 
-- Idle + matching detection → starts session (`session:` / `chunk:1`) at `auto_capture_frequency_hz`
-- Active + detections → refreshes last-seen; 60s chunk rollover unchanged
+- Idle + matching detection → starts capturing at `auto_capture_frequency_hz`
+- Active + detections → refreshes last-seen
 - After ≥1 detection, gap ≥ `inactivity_seconds` → auto-stop
 - Manual `start_capture` with zero detections → stays on until `stop_capture`
 - Manual start, then a detection, then inactivity → stops
+- Captured images carry `default_tags`, any `start_capture` tags, and band tags while capturing. Sequences are never opened automatically — only by `start_sequence`
 
 ## DoCommand
 
@@ -61,6 +61,8 @@ When `vision` is set, Validate requires `camera` and both are returned as requir
 ```json
 {"stop_capture": true}
 ```
+
+Manual only — these open and close a Sequence without changing capture. Capture sessions never open one on their own.
 
 ```json
 {"start_sequence": true, "tags": ["boat-a"]}

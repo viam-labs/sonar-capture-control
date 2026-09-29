@@ -1,10 +1,10 @@
 # Module sonar-capture-control
 
-Drives Viam Data Manager capture (via `capture_control_sensor`) with session/chunk Sequences. Manual DoCommand in Phase 1; Phase 2 adds optional vision auto start/stop on `downsonar` detections.
+Drives Viam Data Manager capture (via `capture_control_sensor`) and can tag every captured image with bucketed sensor readings. Manual DoCommand in Phase 1; Phase 2 adds optional vision auto start/stop on `downsonar` detections.
 
 ## Models
 
-- [`viam:sonar-capture-control:capture-control`](viam_sonar-capture-control_capture-control.md) — capture-control sensor with overrides/sequences and optional vision poller
+- [`viam:sonar-capture-control:capture-control`](viam_sonar-capture-control_capture-control.md) — capture-control sensor with capture overrides, image tagging and optional vision poller
 
 ## Quick config (Phase 2 auto)
 

@@ -31,7 +31,6 @@ func realMain() error {
 			{ResourceName: "seatemp", Method: "Readings"},
 		},
 		DefaultCaptureFrequencyHz: 0,
-		SequenceMaxSeconds:        60,
 		InactivitySeconds:         10,
 	}
 

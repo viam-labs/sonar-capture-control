@@ -33,3 +33,9 @@ bin
 .VIAM_RELOAD_ARCHIVE.tar.gz
 reload-*/
 
+
+# Local sonar frames used by replay tests -- client data, never commit
+data/
+
+# macOS
+.DS_Store
