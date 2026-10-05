@@ -3,6 +3,7 @@ package sonarcapturecontrol
 import (
 	"context"
 	"image"
+	"math"
 	"testing"
 	"time"
 
@@ -21,8 +22,15 @@ func testConfig() *Config {
 			{ResourceName: "depth", Method: "Readings"},
 			{ResourceName: "seatemp", Method: "Readings"},
 		},
-		DefaultCaptureFrequencyHz: 0,
 	}
+}
+
+// sessionFreq is the capture frequency every resource gets during a session:
+// once per captureInterval.
+const sessionFreq = 1.0 / 6
+
+func isSessionFreq(f interface{}) bool {
+	return math.Abs(float64(f.(float32))-sessionFreq) < 1e-6
 }
 
 func newTestSensor(t *testing.T, cfg *Config, now func() time.Time) *sonarCaptureControlCaptureControl {
@@ -54,6 +62,12 @@ func TestConfigValidate(t *testing.T) {
 	cfg = testConfig()
 	if _, _, err := cfg.Validate("components.0"); err != nil {
 		t.Fatalf("unexpected validate error: %v", err)
+	}
+
+	cfg = testConfig()
+	cfg.Resources = []ResourceMethod{{ResourceName: "depth", Method: "Readings"}}
+	if _, _, err := cfg.Validate("components.0"); err == nil {
+		t.Fatal("expected error without an image resource")
 	}
 
 	cfg = testConfig()
@@ -97,14 +111,13 @@ func TestStartStopCapture(t *testing.T) {
 
 	resp, err := s.DoCommand(context.Background(), map[string]interface{}{
 		"start_capture": true,
-		"frequency_hz":  1.0,
 		"tags":          []interface{}{"boat-a"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp["capture_frequency_hz"] != float32(1) {
-		t.Fatalf("start response freq=%v", resp["capture_frequency_hz"])
+	if tags := asStrings(resp["tags"].([]interface{})); len(tags) != 1 || tags[0] != "boat-a" {
+		t.Fatalf("start response tags=%v", tags)
 	}
 
 	readings, err := s.Readings(context.Background(), nil)
@@ -113,15 +126,15 @@ func TestStartStopCapture(t *testing.T) {
 	}
 	overrides := readings["overrides"].([]interface{})
 	o0 := overrides[0].(map[string]interface{})
-	if o0["capture_frequency_hz"].(float32) != 1 {
+	if !isSessionFreq(o0["capture_frequency_hz"]) {
 		t.Fatalf("freq=%v", o0["capture_frequency_hz"])
 	}
-	// Only the requested tags: no session:/chunk: tags, and no Sequence.
+	// Only the requested tags, and no sequence before the first capture.
 	if tags := asStrings(o0["tags"].([]interface{})); len(tags) != 1 || tags[0] != "boat-a" {
 		t.Fatalf("tags=%v, want [boat-a]", tags)
 	}
 	if _, ok := readings["sequences"]; ok {
-		t.Fatal("an active session must not open a sequence")
+		t.Fatal("no sequence before the first capture")
 	}
 
 	if _, err := s.DoCommand(context.Background(), map[string]interface{}{"stop_capture": true}); err != nil {
@@ -145,7 +158,6 @@ func TestNewSessionAfterStop(t *testing.T) {
 
 	if _, err := s.DoCommand(context.Background(), map[string]interface{}{
 		"start_capture": true,
-		"frequency_hz":  1.0,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -156,22 +168,23 @@ func TestNewSessionAfterStop(t *testing.T) {
 	now = t2
 	resp, err := s.DoCommand(context.Background(), map[string]interface{}{
 		"start_capture": true,
-		"frequency_hz":  1.0,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp["capture_frequency_hz"] != float32(1) || !s.sessionActive {
-		t.Fatalf("restart after stop: freq=%v active=%v", resp["capture_frequency_hz"], s.sessionActive)
+	if !s.sessionActive || !s.sessionStartedAt.Equal(t2) {
+		t.Fatalf("restart after stop: active=%v started=%v", s.sessionActive, s.sessionStartedAt)
 	}
+	_ = resp
 }
 
 func TestManualSequenceOnly(t *testing.T) {
 	s := newTestSensor(t, testConfig(), nil)
 
-	// Capturing does not open a Sequence on its own.
+	// Right after start_capture there is no sequence: the first capture is
+	// 6 s away.
 	if _, err := s.DoCommand(context.Background(), map[string]interface{}{
-		"start_capture": true, "frequency_hz": 1.0,
+		"start_capture": true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +193,7 @@ func TestManualSequenceOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := readings["sequences"]; ok {
-		t.Fatal("start_capture must not open a sequence")
+		t.Fatal("no sequence before the first capture")
 	}
 
 	// start_sequence opens exactly one, and leaves capture as it was.
@@ -205,7 +218,7 @@ func TestManualSequenceOnly(t *testing.T) {
 		t.Fatalf("want 5 sequence resources, got %d", n)
 	}
 	o0 := readings["overrides"].([]interface{})[0].(map[string]interface{})
-	if o0["capture_frequency_hz"].(float32) != 1 {
+	if !isSessionFreq(o0["capture_frequency_hz"]) {
 		t.Fatalf("start_sequence changed capture frequency to %v", o0["capture_frequency_hz"])
 	}
 
@@ -232,9 +245,7 @@ func TestUnknownCommand(t *testing.T) {
 
 func TestAutoStartFromDetection(t *testing.T) {
 	fixed := time.Date(2026, 9, 4, 20, 11, 20, 0, time.Local)
-	cfg := testConfig()
-	cfg.AutoCaptureFrequencyHz = 1
-	s := newTestSensor(t, cfg, func() time.Time { return fixed })
+	s := newTestSensor(t, testConfig(), func() time.Time { return fixed })
 	s.detect = func(ctx context.Context) (detectOutcome, error) {
 		return detectOutcome{found: true, bestScore: 0.91, sawLabel: true}, nil
 	}
@@ -246,7 +257,7 @@ func TestAutoStartFromDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 	o0 := readings["overrides"].([]interface{})[0].(map[string]interface{})
-	if o0["capture_frequency_hz"].(float32) != 1 {
+	if !isSessionFreq(o0["capture_frequency_hz"]) {
 		t.Fatalf("freq=%v", o0["capture_frequency_hz"])
 	}
 	if tags := asStrings(o0["tags"].([]interface{})); len(tags) != 0 {
@@ -320,7 +331,6 @@ func TestManualOnlyNoAutoStop(t *testing.T) {
 
 	if _, err := s.DoCommand(context.Background(), map[string]interface{}{
 		"start_capture": true,
-		"frequency_hz":  1.0,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +361,6 @@ func TestManualThenDetectionThenInactivityStops(t *testing.T) {
 
 	if _, err := s.DoCommand(context.Background(), map[string]interface{}{
 		"start_capture": true,
-		"frequency_hz":  1.0,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -423,57 +432,89 @@ func TestResourceName(t *testing.T) {
 	_ = resource.Name{}
 }
 
-func TestBandTagFormat(t *testing.T) {
-	b := BandTag{Tag: "depth_band", Width: 10, Unit: "fm"}
-	for _, tc := range []struct {
-		in   float64
-		want string
-	}{
-		{93.01, "depth_band:90-100fm"},
-		{90, "depth_band:90-100fm"},
-		{99.99, "depth_band:90-100fm"},
-		{100, "depth_band:100-110fm"},
-		{4.7, "depth_band:0-10fm"},
-	} {
-		if got := b.format(tc.in); got != tc.want {
-			t.Errorf("format(%v) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
-func TestReadingFloatAcceptsNestedShape(t *testing.T) {
-	flat := map[string]interface{}{"Water Temperature": 27.5}
-	if v, ok := readingFloat(flat, "Water Temperature"); !ok || v != 27.5 {
-		t.Errorf("flat: got %v %v", v, ok)
-	}
-	nested := map[string]interface{}{"readings": map[string]interface{}{"Depth": 93.01}}
-	if v, ok := readingFloat(nested, "Depth"); !ok || v != 93.01 {
-		t.Errorf("nested: got %v %v", v, ok)
-	}
-	if _, ok := readingFloat(flat, "missing"); ok {
-		t.Error("missing key should not resolve")
-	}
-}
-
-func TestBandTagsAppearInReadingsOnlyDuringSession(t *testing.T) {
+func TestPerCaptureSequences(t *testing.T) {
 	cfg := testConfig()
-	s := newTestSensor(t, cfg, nil)
-	s.bandTags = []string{"depth_band:90-100fm"}
+	t0 := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC) // on a 6 s boundary
+	now := t0
+	s := newTestSensor(t, cfg, func() time.Time { return now })
 
-	// Outside a session the module emits only its base tags.
-	if tags := s.currentTagsLocked(); len(tags) != 0 {
-		t.Fatalf("idle tags = %v, want none", tags)
+	read := func() map[string]interface{} {
+		t.Helper()
+		r, err := s.Readings(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	// Idle: no session, so no sequence.
+	if _, ok := read()["sequences"]; ok {
+		t.Fatal("idle module must not open a sequence")
 	}
 
-	s.startSessionLocked(1, nil, false)
-	tags := s.currentTagsLocked()
-	var found bool
-	for _, tag := range tags {
-		if tag == "depth_band:90-100fm" {
-			found = true
+	if _, err := s.DoCommand(context.Background(), map[string]interface{}{
+		"start_capture": true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every resource -- image and readings alike -- captures once every 6 s.
+	r := read()
+	for _, o := range r["overrides"].([]interface{}) {
+		o := o.(map[string]interface{})
+		if !isSessionFreq(o["capture_frequency_hz"]) {
+			t.Fatalf("%s/%s frequency %v, want 1/6", o["resource_name"], o["method"], o["capture_frequency_hz"])
 		}
 	}
-	if !found {
-		t.Fatalf("band tag missing from %v", tags)
+
+	// A 1.5-second sequence is open around each capture (start + 6 s, 12 s, ...)
+	// and closed in between.
+	isOpen := func(at time.Duration) bool {
+		now = t0.Add(at)
+		seqs, ok := read()["sequences"].([]interface{})
+		if ok && len(seqs) != 1 {
+			t.Fatalf("at +%v: want at most one sequence, got %d", at, len(seqs))
+		}
+		if ok {
+			seq := seqs[0].(map[string]interface{})
+			if n := len(seq["resources"].([]interface{})); n != len(cfg.Resources) {
+				t.Fatalf("sequence covers %d resources, want %d", n, len(cfg.Resources))
+			}
+		}
+		return ok
+	}
+	if _, ok := r["sequences"]; ok {
+		t.Fatal("sequence open at session start, before any capture")
+	}
+	for _, tc := range []struct {
+		at   time.Duration
+		open bool
+	}{
+		{3 * time.Second, false},
+		{5100 * time.Millisecond, false},
+		{5300 * time.Millisecond, true}, // 0.75 s before the first capture
+		{6 * time.Second, true},         // the first capture
+		{6700 * time.Millisecond, true},
+		{6900 * time.Millisecond, false}, // closed straight after
+		{9 * time.Second, false},
+		{12 * time.Second, true}, // the second capture
+		{12900 * time.Millisecond, false},
+	} {
+		if got := isOpen(tc.at); got != tc.open {
+			t.Fatalf("at +%v: sequence open=%v, want %v", tc.at, got, tc.open)
+		}
+	}
+
+	// Stopping capture ends the sequences and turns the camera off.
+	if _, err := s.DoCommand(context.Background(), map[string]interface{}{"stop_capture": true}); err != nil {
+		t.Fatal(err)
+	}
+	r = read()
+	if _, ok := r["sequences"]; ok {
+		t.Fatal("stopped session must not keep a sequence open")
+	}
+	for _, o := range r["overrides"].([]interface{}) {
+		if f := o.(map[string]interface{})["capture_frequency_hz"].(float32); f != 0 {
+			t.Fatalf("frequency %v after stop, want 0", f)
+		}
 	}
 }

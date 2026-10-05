@@ -30,8 +30,7 @@ func realMain() error {
 			{ResourceName: "depth", Method: "Readings"},
 			{ResourceName: "seatemp", Method: "Readings"},
 		},
-		DefaultCaptureFrequencyHz: 0,
-		InactivitySeconds:         10,
+		InactivitySeconds: 10,
 	}
 
 	thing, err := sonarcapturecontrol.NewCaptureControl(ctx, deps, sensor.Named("foo"), &cfg, logger)

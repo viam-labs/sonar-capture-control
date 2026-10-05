@@ -3,7 +3,6 @@ package sonarcapturecontrol
 import (
 	"context"
 	"fmt"
-	"math"
 	"strings"
 	"sync"
 	"time"
@@ -20,11 +19,18 @@ var (
 )
 
 const (
-	defaultInactivitySeconds      = 10
-	defaultDetectionLabel         = "downsonar"
-	defaultDetectionConfidence    = 0.8
-	defaultDetectionPollHz        = 1.0
-	defaultAutoCaptureFrequencyHz = 1.0
+	defaultInactivitySeconds   = 10
+	defaultDetectionLabel      = "downsonar"
+	defaultDetectionConfidence = 0.8
+	defaultDetectionPollHz     = 1.0
+)
+
+// While a session runs, the camera and every sensor capture together once per
+// captureInterval, and each capture is wrapped in its own sequence lasting
+// 2*sequenceHalfWidth: one image plus one set of readings.
+const (
+	captureInterval   = 6 * time.Second
+	sequenceHalfWidth = 750 * time.Millisecond
 )
 
 func init() {
@@ -41,49 +47,16 @@ type ResourceMethod struct {
 	Method       string `json:"method"`
 }
 
-// BandTag turns a numeric sensor reading into a coarse bucketed tag such as
-// "depth_band:90-100fm".
-//
-// The bucketing is the point. Tagging raw readings would mint a distinct tag
-// per frame -- one 60-second window of this fleet's data carries 59 distinct
-// compass headings and 59 distinct positions -- which leaves the organization
-// with hundreds of thousands of single-use tags and a tag vocabulary that can
-// no longer be used to filter anything. Bands stay in the tens, so they remain
-// useful for browsing and for stratifying annotation batches. Precise values
-// belong in tabular data, which is captured alongside the images.
-type BandTag struct {
-	// Sensor is the resource name to read.
-	Sensor string `json:"sensor"`
-	// Reading is the key within that sensor's Readings map.
-	Reading string `json:"reading"`
-	// Tag is the emitted prefix, e.g. "depth_band".
-	Tag string `json:"tag"`
-	// Width is the bucket size in the reading's own units.
-	Width float64 `json:"width"`
-	// Unit is an optional suffix appended to the range, e.g. "fm".
-	Unit string `json:"unit,omitempty"`
-}
-
-// format buckets v and renders the tag. 93.01 with width 10 becomes "90-100".
-func (b BandTag) format(v float64) string {
-	lo := math.Floor(v/b.Width) * b.Width
-	return fmt.Sprintf("%s:%g-%g%s", b.Tag, lo, lo+b.Width, b.Unit)
-}
-
 // Config configures which resources to capture, how captured data is tagged,
 // and optional vision-driven auto start/stop.
 type Config struct {
 	// Resources are the resource/method pairs this sensor controls. Each pair
 	// is emitted under "overrides" every poll, carrying the current capture
-	// frequency and tags.
+	// frequency and tags. At least one must be an image (GetImages/GetImage).
 	Resources []ResourceMethod `json:"resources"`
 
-	// DefaultCaptureFrequencyHz is the capture frequency emitted until a
-	// start_capture DoCommand changes it. 0 disables capture.
-	DefaultCaptureFrequencyHz float32 `json:"default_capture_frequency_hz"`
-
-	// DefaultTags are base tags applied to everything captured, alongside any
-	// band tags while a session is active.
+	// DefaultTags are base tags applied to everything captured and to every
+	// sequence.
 	DefaultTags []string `json:"default_tags,omitempty"`
 
 	// InactivitySeconds ends an auto/detection session after this many seconds
@@ -93,7 +66,7 @@ type Config struct {
 	InactivitySeconds float64 `json:"inactivity_seconds,omitempty"`
 
 	// Vision is the vision service used for auto start/stop. When empty, auto
-	// detection is disabled (Phase 1 manual-only behavior).
+	// detection is disabled and sessions start and stop only by DoCommand.
 	Vision string `json:"vision,omitempty"`
 
 	// Camera is passed to DetectionsFromCamera. Required when Vision is set.
@@ -107,14 +80,11 @@ type Config struct {
 
 	// DetectionPollHz is how often to poll vision. Default 1.
 	DetectionPollHz float64 `json:"detection_poll_hz,omitempty"`
+}
 
-	// AutoCaptureFrequencyHz is the capture frequency used when auto-starting
-	// from a detection. Default 1.
-	AutoCaptureFrequencyHz float32 `json:"auto_capture_frequency_hz,omitempty"`
-
-	// BandTags are optional sensor readings added to captured data as bucketed
-	// tags while a session is active. Empty disables the feature.
-	BandTags []BandTag `json:"band_tags,omitempty"`
+// isImageMethod reports whether a resource/method pair produces images.
+func isImageMethod(method string) bool {
+	return method == "GetImages" || method == "GetImage"
 }
 
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
@@ -139,19 +109,12 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		return nil, nil, fmt.Errorf("%s.detection_poll_hz cannot be negative", path)
 	}
 
-	for i, b := range cfg.BandTags {
-		if b.Sensor == "" {
-			return nil, nil, fmt.Errorf("%s.band_tags[%d].sensor is required", path, i)
-		}
-		if b.Reading == "" {
-			return nil, nil, fmt.Errorf("%s.band_tags[%d].reading is required", path, i)
-		}
-		if b.Tag == "" {
-			return nil, nil, fmt.Errorf("%s.band_tags[%d].tag is required", path, i)
-		}
-		if b.Width <= 0 {
-			return nil, nil, fmt.Errorf("%s.band_tags[%d].width must be positive", path, i)
-		}
+	hasImage := false
+	for _, r := range cfg.Resources {
+		hasImage = hasImage || isImageMethod(r.Method)
+	}
+	if !hasImage {
+		return nil, nil, fmt.Errorf("%s.resources needs an image resource (method GetImages or GetImage)", path)
 	}
 
 	var deps []string
@@ -160,13 +123,6 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 			return nil, nil, fmt.Errorf("%s.camera is required when vision is set", path)
 		}
 		deps = append(deps, cfg.Vision, cfg.Camera)
-	}
-	seen := map[string]bool{}
-	for _, b := range cfg.BandTags {
-		if !seen[b.Sensor] {
-			seen[b.Sensor] = true
-			deps = append(deps, b.Sensor)
-		}
 	}
 	return deps, nil, nil
 }
@@ -201,13 +157,6 @@ func (cfg *Config) detectionPollInterval() time.Duration {
 	return time.Duration(float64(time.Second) / hz)
 }
 
-func (cfg *Config) autoCaptureFrequency() float32 {
-	if cfg.AutoCaptureFrequencyHz == 0 {
-		return defaultAutoCaptureFrequencyHz
-	}
-	return cfg.AutoCaptureFrequencyHz
-}
-
 // detectOutcome is the result of one vision poll for the configured label.
 type detectOutcome struct {
 	// found is true when the label is present at or above detection_confidence.
@@ -239,9 +188,9 @@ type sonarCaptureControlCaptureControl struct {
 	cancelFunc context.CancelFunc
 
 	mu                       sync.Mutex
-	captureFrequencyHz       float32
 	extraTags                []string
 	sessionActive            bool
+	sessionStartedAt         time.Time
 	lastDetectionAt          time.Time
 	seenDetectionThisSession bool
 	// lastPoll* tracks the most recent successful detection poll for stop logs.
@@ -249,16 +198,8 @@ type sonarCaptureControlCaptureControl struct {
 	lastPollBestScore float64
 	lastPollSawLabel  bool
 
-	// bandSensors is nil when band_tags is unconfigured, and every use is
-	// guarded so the module keeps its original behaviour without it.
-	bandSensors map[string]sensor.Sensor
-
-	// bandTags holds the most recently computed bucket tags, refreshed off the
-	// poll loop so Readings never blocks on another resource.
-	bandTags []string
-
 	// manualSequenceActive is set only by the start_sequence / stop_sequence
-	// commands. Capture sessions never open a Sequence on their own.
+	// commands: one extra sequence on top of the per-capture ones.
 	manualSequenceActive bool
 	sequenceTags         []string
 }
@@ -286,14 +227,13 @@ func NewCaptureControl(
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	s := &sonarCaptureControlCaptureControl{
-		name:               name,
-		logger:             logger,
-		cfg:                conf,
-		now:                time.Now,
-		cancelCtx:          cancelCtx,
-		cancelFunc:         cancelFunc,
-		captureFrequencyHz: conf.DefaultCaptureFrequencyHz,
-		extraTags:          append([]string(nil), conf.DefaultTags...),
+		name:       name,
+		logger:     logger,
+		cfg:        conf,
+		now:        time.Now,
+		cancelCtx:  cancelCtx,
+		cancelFunc: cancelFunc,
+		extraTags:  append([]string(nil), conf.DefaultTags...),
 	}
 
 	if conf.Vision != "" {
@@ -305,25 +245,6 @@ func NewCaptureControl(
 		s.vision = vis
 		s.detect = s.detectFromVision
 		go s.pollDetections()
-	}
-
-	if len(conf.BandTags) > 0 {
-		s.bandSensors = make(map[string]sensor.Sensor, len(conf.BandTags))
-		for _, b := range conf.BandTags {
-			if _, ok := s.bandSensors[b.Sensor]; ok {
-				continue
-			}
-			sens, err := sensor.FromDependencies(deps, b.Sensor)
-			if err != nil {
-				cancelFunc()
-				return nil, fmt.Errorf("band_tags sensor %q: %w", b.Sensor, err)
-			}
-			s.bandSensors[b.Sensor] = sens
-		}
-	}
-
-	if s.bandSensors != nil {
-		go s.pollBandTags()
 	}
 
 	return s, nil
@@ -340,12 +261,21 @@ func (s *sonarCaptureControlCaptureControl) Status(ctx context.Context) (map[str
 func (s *sonarCaptureControlCaptureControl) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	s.mu.Lock()
 	s.maybeInactivityStopLocked()
-	freq := s.captureFrequencyHz
-	tags := toAny(s.currentTagsLocked())
+	tags := toAny(s.extraTags)
 	seqActive := s.manualSequenceActive
 	seqTags := toAny(s.sequenceTags)
+	sessionActive := s.sessionActive
+	sessionStart := s.sessionStartedAt
+	now := s.now()
 	s.mu.Unlock()
 
+	// Every resource captures once per interval while a session runs. They are
+	// all switched on in the same Data Manager update, so their timers start
+	// together and each image and its readings are taken at the same moment.
+	var freq float32
+	if sessionActive {
+		freq = float32(time.Second) / float32(captureInterval)
+	}
 	overrides := make([]interface{}, 0, len(s.cfg.Resources))
 	for _, r := range s.cfg.Resources {
 		overrides = append(overrides, map[string]interface{}{
@@ -356,55 +286,77 @@ func (s *sonarCaptureControlCaptureControl) Readings(ctx context.Context, extra 
 		})
 	}
 
-	out := map[string]interface{}{"overrides": overrides}
-	// The sequences key is sent only while a manual sequence is open. The Data
+	// The sequences key is sent only while a sequence should be open. The Data
 	// Manager treats a missing key exactly like an empty list -- it closes any
-	// open Sequence -- so leaving it out is also how stop_sequence takes effect.
+	// open Sequence -- so leaving it out is also how a sequence ends.
+	var sequences []interface{}
 	if seqActive {
-		resources := make([]interface{}, 0, len(s.cfg.Resources))
-		for _, r := range s.cfg.Resources {
-			resources = append(resources, map[string]interface{}{
-				"resource_name": r.ResourceName,
-				"method":        r.Method,
-			})
-		}
-		out["sequences"] = []interface{}{map[string]interface{}{
-			"resources":     resources,
-			"sequence_tags": seqTags,
-		}}
+		sequences = append(sequences, s.sequenceEntry(seqTags))
+	}
+	if sessionActive && aroundCapture(now, sessionStart) {
+		sequences = append(sequences, s.sequenceEntry(tags))
+	}
+
+	out := map[string]interface{}{"overrides": overrides}
+	if len(sequences) > 0 {
+		out["sequences"] = sequences
 	}
 	return out, nil
+}
+
+// sequenceEntry is one sequence covering every configured resource.
+func (s *sonarCaptureControlCaptureControl) sequenceEntry(tags []interface{}) map[string]interface{} {
+	resources := make([]interface{}, 0, len(s.cfg.Resources))
+	for _, r := range s.cfg.Resources {
+		resources = append(resources, map[string]interface{}{
+			"resource_name": r.ResourceName,
+			"method":        r.Method,
+		})
+	}
+	return map[string]interface{}{"resources": resources, "sequence_tags": tags}
+}
+
+// aroundCapture reports whether now falls inside the sequence wrapped around
+// one of the session's captures.
+//
+// Collectors fire one full interval after they start, and every resource is
+// switched on in the same Data Manager update, so captures land together at
+// session start + k*captureInterval for k = 1, 2, 3 ... The sequence is open
+// from sequenceHalfWidth before each capture to sequenceHalfWidth after it and
+// closed in between; the Data Manager closes a sequence on the first check
+// (every 100 ms) where it is no longer listed, so each one holds exactly that
+// capture.
+func aroundCapture(now, sessionStart time.Time) bool {
+	elapsed := now.Sub(sessionStart)
+	k := (elapsed + captureInterval/2) / captureInterval // nearest capture
+	if k < 1 {
+		return false
+	}
+	offset := elapsed - k*captureInterval
+	return offset >= -sequenceHalfWidth && offset <= sequenceHalfWidth
 }
 
 // DoCommand exposes four commands. Each is selected by setting its key to true;
 // optional arguments are read from sibling keys on the same map.
 //
-//	{"start_capture": true, "frequency_hz": 2.0, "tags": ["boat-a"]}  // opens a session
-//	{"stop_capture":  true}                                           // closes it, freq=0
-//	{"start_sequence": true, "tags": ["boat-a"]}  // manual only; capture is unchanged
+//	{"start_capture": true, "tags": ["boat-a"]}   // opens a session
+//	{"stop_capture":  true}                       // closes it
+//	{"start_sequence": true, "tags": ["boat-a"]}  // one extra sequence; capture is unchanged
 //	{"stop_sequence":  true}
 func (s *sonarCaptureControlCaptureControl) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	switch {
 	case cmd["start_capture"] == true:
-		freq := s.cfg.DefaultCaptureFrequencyHz
-		if v, ok := asFloat64(cmd["frequency_hz"]); ok {
-			freq = float32(v)
-		}
 		extra := append([]string(nil), s.cfg.DefaultTags...)
 		if v, ok := stringList(cmd["tags"]); ok {
 			extra = append(extra, v...)
 		}
 
 		s.mu.Lock()
-		s.startSessionLocked(freq, extra, false /* fromDetection */)
-		tags := s.currentTagsLocked()
+		s.startSessionLocked(extra, false /* fromDetection */)
 		s.mu.Unlock()
 
-		s.logger.Infof("start_capture frequency_hz=%v tags=%v", freq, tags)
-		return map[string]interface{}{
-			"capture_frequency_hz": freq,
-			"tags":                 toAny(tags),
-		}, nil
+		s.logger.Infof("start_capture tags=%v", extra)
+		return map[string]interface{}{"tags": toAny(extra)}, nil
 
 	case cmd["stop_capture"] == true:
 		s.mu.Lock()
@@ -450,11 +402,11 @@ func (s *sonarCaptureControlCaptureControl) Close(context.Context) error {
 // startSessionLocked opens a new capture session. If fromDetection is true,
 // marks that a detection has been seen (enables inactivity timeout).
 // Caller must hold s.mu.
-func (s *sonarCaptureControlCaptureControl) startSessionLocked(freq float32, extraTags []string, fromDetection bool) {
+func (s *sonarCaptureControlCaptureControl) startSessionLocked(extraTags []string, fromDetection bool) {
 	now := s.now()
-	s.captureFrequencyHz = freq
 	s.extraTags = append([]string(nil), extraTags...)
 	s.sessionActive = true
+	s.sessionStartedAt = now
 	if fromDetection {
 		s.lastDetectionAt = now
 		s.seenDetectionThisSession = true
@@ -469,8 +421,8 @@ func (s *sonarCaptureControlCaptureControl) startSessionLocked(freq float32, ext
 // Caller must hold s.mu.
 func (s *sonarCaptureControlCaptureControl) stopSessionLocked(reason string) {
 	wasActive := s.sessionActive
-	s.captureFrequencyHz = 0
 	s.sessionActive = false
+	s.sessionStartedAt = time.Time{}
 	s.lastDetectionAt = time.Time{}
 	s.seenDetectionThisSession = false
 	s.extraTags = append([]string(nil), s.cfg.DefaultTags...)
@@ -479,75 +431,6 @@ func (s *sonarCaptureControlCaptureControl) stopSessionLocked(reason string) {
 	} else {
 		s.logger.Infof("stop_capture reason=%s (already idle)", reason)
 	}
-}
-
-// pollBandTags refreshes band tags on its own loop. Readings() is called by the
-// data manager on every capture tick and must not block on other resources, so
-// the tags it reports are whatever this loop last cached. A read that fails
-// leaves the previous tags in place rather than clearing them: a transient
-// failure should not strip tags mid-session.
-func (s *sonarCaptureControlCaptureControl) pollBandTags() {
-	ticker := time.NewTicker(s.cfg.detectionPollInterval())
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.cancelCtx.Done():
-			return
-		case <-ticker.C:
-			if tags, ok := s.readBandTags(s.cancelCtx); ok {
-				s.mu.Lock()
-				s.bandTags = tags
-				s.mu.Unlock()
-			}
-		}
-	}
-}
-
-// readBandTags reads each configured sensor once and buckets the named
-// readings. Returns false only when every sensor failed, so a partial read
-// still updates what it can.
-func (s *sonarCaptureControlCaptureControl) readBandTags(ctx context.Context) ([]string, bool) {
-	cache := make(map[string]map[string]interface{}, len(s.bandSensors))
-	anyOK := false
-	for name, sens := range s.bandSensors {
-		r, err := sens.Readings(ctx, nil)
-		if err != nil {
-			s.logger.Debugf("band_tags sensor %q read failed: %v", name, err)
-			continue
-		}
-		cache[name] = r
-		anyOK = true
-	}
-	if !anyOK {
-		return nil, false
-	}
-	out := make([]string, 0, len(s.cfg.BandTags))
-	for _, b := range s.cfg.BandTags {
-		r, ok := cache[b.Sensor]
-		if !ok {
-			continue
-		}
-		v, ok := readingFloat(r, b.Reading)
-		if !ok {
-			continue
-		}
-		out = append(out, b.format(v))
-	}
-	return out, true
-}
-
-// readingFloat pulls a numeric value out of a Readings map, tolerating the
-// nested {"readings": {...}} shape that several sensors emit.
-func readingFloat(r map[string]interface{}, key string) (float64, bool) {
-	if v, ok := asFloat64(r[key]); ok {
-		return v, true
-	}
-	if nested, ok := r["readings"].(map[string]interface{}); ok {
-		if v, ok := asFloat64(nested[key]); ok {
-			return v, true
-		}
-	}
-	return 0, false
 }
 
 func (s *sonarCaptureControlCaptureControl) pollDetections() {
@@ -585,10 +468,9 @@ func (s *sonarCaptureControlCaptureControl) tickDetection(ctx context.Context) {
 
 	if out.found {
 		if !s.sessionActive {
-			freq := s.cfg.autoCaptureFrequency()
-			s.startSessionLocked(freq, append([]string(nil), s.cfg.DefaultTags...), true)
-			s.logger.Infof("auto start_capture frequency_hz=%v score=%.3f label=%s",
-				freq, out.bestScore, s.cfg.detectionLabel())
+			s.startSessionLocked(append([]string(nil), s.cfg.DefaultTags...), true)
+			s.logger.Infof("auto start_capture score=%.3f label=%s",
+				out.bestScore, s.cfg.detectionLabel())
 		} else {
 			s.lastDetectionAt = now
 			s.seenDetectionThisSession = true
@@ -635,10 +517,6 @@ func bestLabelScore(dets []objectdetection.Detection, label string) (best float6
 	return best, saw
 }
 
-func matchingDetection(dets []objectdetection.Detection, label string, minScore float64) bool {
-	return evaluateDetections(dets, label, minScore).found
-}
-
 // maybeInactivityStopLocked stops the session when inactivity has elapsed after
 // at least one detection this session. Caller must hold s.mu.
 func (s *sonarCaptureControlCaptureControl) maybeInactivityStopLocked() {
@@ -652,7 +530,7 @@ func (s *sonarCaptureControlCaptureControl) maybeInactivityStopLocked() {
 	}
 	label := s.cfg.detectionLabel()
 	conf := s.cfg.detectionConfidence()
-	scoreInfo := "none (label not present on last poll)"
+	var scoreInfo string
 	if s.lastPollSawLabel {
 		scoreInfo = fmt.Sprintf("%.3f (below confidence %.2f)", s.lastPollBestScore, conf)
 		if s.lastPollBestScore >= conf {
@@ -670,18 +548,6 @@ func (s *sonarCaptureControlCaptureControl) maybeInactivityStopLocked() {
 		label, conf, s.cfg.inactivity(), since.Round(time.Millisecond), label, scoreInfo,
 	)
 	s.stopSessionLocked(reason)
-}
-
-// currentTagsLocked returns the merged tags applied to captured data.
-// Caller must hold s.mu.
-func (s *sonarCaptureControlCaptureControl) currentTagsLocked() []string {
-	if !s.sessionActive {
-		return append([]string(nil), s.extraTags...)
-	}
-	out := make([]string, 0, len(s.extraTags)+len(s.bandTags))
-	out = append(out, s.extraTags...)
-	out = append(out, s.bandTags...)
-	return out
 }
 
 func stringList(v interface{}) ([]string, bool) {
@@ -706,19 +572,4 @@ func toAny(ss []string) []interface{} {
 		out[i] = s
 	}
 	return out
-}
-
-func asFloat64(v interface{}) (float64, bool) {
-	switch x := v.(type) {
-	case float64:
-		return x, true
-	case float32:
-		return float64(x), true
-	case int:
-		return float64(x), true
-	case int64:
-		return float64(x), true
-	default:
-		return 0, false
-	}
 }
