@@ -37,7 +37,5 @@ func realMain() error {
 	if err != nil {
 		return err
 	}
-	defer thing.Close(ctx)
-
-	return nil
+	return thing.Close(ctx)
 }
